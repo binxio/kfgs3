@@ -1,0 +1,256 @@
+Resources:
+
+# Firehose needs to write some logging to CloudWatch Logs
+# Firehose doesn't create it for us, so we have to create it.
+# The LogGroup can be generic, the log stream depends on the name.
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: "firehose"
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties: 
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: !Sub "${AWS::StackName}"
+
+# To allow Firehose to read the data from Kinesis and write to the S3 bucket
+# we need a Source and Delivery Role
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: FirehoseDeliveryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${S3Bucket.Arn}"
+                  - !Sub "${S3Bucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt FirehoseTransformLambda.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - "arn:aws:logs:*:*:*"
+  SourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: "FirehoseSourceAccess"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:*
+                Resource:
+                  - !Sub "${KinesisStream.Arn}"
+              - Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                Resource: '*'
+
+# Kinesis Stream is the resource where to write data to
+# Messages are stored for 24 hours
+# 1 Shard means max 1000 PUTs per second or 1MB/s
+  KinesisStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      RetentionPeriodHours: 24
+      ShardCount: 1
+  
+# We need an S3 bucket of course. Probably in the most setups
+# this S3 bucket is a central bucket maintained in another cfn stack
+  S3Bucket:
+    Type: AWS::S3::Bucket
+
+# Firehose is consuming this data stream and writes to an S3 bucket
+# Normally you would encrypt this stuff, but for this demo we skipped this
+  Firehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties: 
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration: 
+        KinesisStreamARN: !GetAtt KinesisStream.Arn
+        RoleARN: !GetAtt SourceRole.Arn
+      ExtendedS3DestinationConfiguration:
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FirehoseTransformLambda.Arn
+        BucketARN: !GetAtt S3Bucket.Arn
+        CloudWatchLoggingOptions:
+          Enabled: True
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 50
+        CompressionFormat: UNCOMPRESSED
+        Prefix: !Sub "firehose/${AWS::StackName}/"
+        RoleARN: !GetAtt DeliveryRole.Arn
+
+# Lambda for Transform
+  FirehoseTransformLambda: 
+    Type: AWS::Lambda::Function
+    Properties: 
+      Handler: "index.lambda_handler"
+      Role: !GetAtt FirehoseTransformLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import base64
+          import json
+
+          print('Loading function')
+
+
+          def lambda_handler(event, context):
+              output = []
+
+              for record in event['records']:
+                  print(record['recordId'])
+                  payload = base64.b64decode(record['data'])
+
+                  # transform payload raw json string to a dict 
+                  # and back to make it proper json on a single line
+                  payload_dict = json.loads(payload)
+                  payload = json.dumps(payload_dict)
+                  
+                  # add a new line (\n) to payload
+                  payload = payload + "\n"
+
+                  output_record = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(payload.encode()).decode("utf-8")
+                  }
+                  output.append(output_record)
+
+                  print(output[0])
+
+              print('Successfully processed {} records.'.format(len(event['records'])))
+
+              return {'records': output}
+
+      Runtime: "python3.6"
+      Timeout: 60
+  FirehoseTransformLambdaRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        Policies:
+          - PolicyName: "basic-lambda"
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource:
+                    - "arn:aws:logs:*:*:*"
+
+# Athena service can crawl an S3 bucket and create a table
+# We need a GlueDatabase, which requires a fixed name
+# To keep it unique within our account, we now use the stackname
+  AthenaGlueCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Role: !Ref 'AthenaAccessRole'
+      DatabaseName: !Ref 'GlueDatabase'
+      Schedule:
+        ScheduleExpression: cron(10 2 * * ? *)
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${S3Bucket}/firehose/${AWS::StackName}/"
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${AWS::StackName}"
+
+# Athena requires access to the S3 bucket
+  AthenaAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: FirehoseAuditDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub "${S3Bucket.Arn}"
+                  - !Sub "${S3Bucket.Arn}/*"
+Outputs:
+  KinesisStream:
+    Value: !Ref KinesisStream
+  S3Bucket:
+    Value: !Ref S3Bucket
