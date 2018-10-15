@@ -23,7 +23,7 @@ New to CloudFormation? This is how you validate, deploy (create / update) and de
 
 ```
 aws cloudformation validate-template \
-    -template-body file://template.yaml
+    --template-body file://template.yaml
 
 aws cloudformation deploy \
     --stack-name <stack_name> \
