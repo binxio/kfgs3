@@ -168,3 +168,5 @@ Outputs:
     Value: !Ref KinesisStream
   S3Bucket:
     Value: !Ref S3Bucket
+  GlueCrawler:
+    Value: !Ref AthenaGlueCrawler
