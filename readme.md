@@ -26,6 +26,7 @@ aws cloudformation validate-template \
     --template-body file://template.yaml
 
 aws cloudformation deploy \
+    --capabilities CAPABILITY_IAM \
     --stack-name <stack_name> \
     --template template.yaml
 
